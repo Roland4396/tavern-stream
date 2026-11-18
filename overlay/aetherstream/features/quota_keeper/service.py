@@ -1,0 +1,473 @@
+"""Native background lifecycle; quota work is independent of chat routing."""
+
+import asyncio
+from contextlib import suppress
+import json
+import time
+from typing import Callable
+
+import httpx
+
+from aetherstream.utils.coerce import coerce_bool
+from .client import GproxyClient, MODEL, ProbeError
+from .policy import FIVE_HOURS, GRACE, RETRY_DELAYS, account_groups, cycle_running, decision, observed, windows
+from .state import StateError, StateStore
+from . import argon, claude, hydrogen, cli
+
+
+async def handle_account(api, members, row, persist, emit, *, clock=time.time, may_generate=lambda: True, model=MODEL):
+    now = clock()
+    if row.get("paused") or now < row.get("next_at", 0):
+        return
+    # Duplicate imports of one email share a single schedule and request guard.
+    choices = [(c, await api.cached(c["id"])) for c in members]
+    c, cached = max(choices, key=lambda pair: (observed(pair[1]),
+                                              pair[0].get("health") != "dead"))
+    cid = c["id"]
+    row["credential_id"] = cid
+    quota = windows(cached)
+    prior = row.get('windows') or {}
+    prior_confirmed = row.get('cycle_confirmed') is True
+    prior_observed = row.get('observed_at_ms', 0) / 1000
+    unconfirmed = bool(row.get('pending_verify') or row.get('uncertain_attempt')
+                       or (row.get('last_trigger_at') and not row.get('cycle_confirmed')))
+    action, next_at = decision(quota, now, observed_at=observed(cached) / 1000,
+                               previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
+    if action == 'wait' and not unconfirmed:
+        row.update(next_at=next_at, status="waiting", windows=quota, failures=0,
+                   observed_at_ms=observed(cached), cycle_confirmed=cycle_running(
+                       quota, '3p-5h', now, observed_at=observed(cached) / 1000,
+                       previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed))
+        persist()
+        return
+    snapshot = await api.probe(cid)
+    now = clock()
+    quota = windows(snapshot)
+    action, next_at = decision(quota, now, observed_at=observed(snapshot) / 1000,
+                               previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
+    row.update(windows=quota, last_probe_at=now, observed_at_ms=observed(snapshot))
+    if action == 'observe':
+        row.update(status='awaiting_cycle_clock', next_at=now + 60, failures=0)
+        persist()
+        return
+    if action == "wait":
+        short = quota.get("3p-5h", {})
+        confirmed = cycle_running(quota, '3p-5h', now,
+                                  observed_at=observed(snapshot) / 1000,
+                                  previous=prior, previous_observed=prior_observed, previous_confirmed=prior_confirmed)
+        if unconfirmed:
+            if not confirmed:
+                checks = row.get('clock_checks', 0) + 1
+                row.update(clock_checks=checks, pending_verify=checks < 2,
+                           cycle_confirmed=False, uncertain_attempt=True, failures=0,
+                           status='awaiting_cycle_clock' if checks < 2 else 'paused_unconfirmed_generation',
+                           next_at=now + 60, paused=checks >= 2)
+                persist()
+                emit('cycle_checked', credential_id=cid, confirmed=False, clock_checks=checks)
+                return
+            row.update(pending_verify=False, cycle_confirmed=True,
+                       uncertain_attempt=False, clock_checks=0, guard_until=short['end'] + GRACE)
+            emit('cycle_checked', credential_id=cid, confirmed=True, next_at=next_at)
+        row.update(next_at=next_at if confirmed else min(next_at, now + 60),
+                   status='waiting' if confirmed else 'awaiting_cycle_clock', failures=0,
+                   cycle_confirmed=confirmed)
+        persist()
+        return
+    if action != "unused":
+        # Unknown or stale quota must not cause a generation.
+        raise ProbeError("Claude window unavailable or reset has not advanced")
+    guard = row.get('guard_until', 0)
+    if unconfirmed:
+        # Uncertainty survives guard expiry and explicit resume. Never turn a
+        # clock/metadata failure into a second potentially paid completion.
+        row.update(next_at=max(guard, now + 60), status='paused_unconfirmed_generation',
+                   pending_verify=False, uncertain_attempt=True, cycle_confirmed=False,
+                   paused=True, failures=0)
+        persist()
+        emit('account_paused', credential_id=cid, reason='generation_cycle_not_confirmed')
+        return
+    if now < guard:
+        row.update(next_at=guard, status='request_guard', failures=0)
+        persist()
+        return
+    if model not in snapshot.get('available_models', []):
+        row.update(status='paused_model_unavailable', paused=True, failures=0, model=model)
+        persist()
+        emit('account_paused', credential_id=cid, reason='configured_model_not_in_catalogue')
+        return
+    if not may_generate():
+        persist()
+        return
+    row.update(last_trigger_at=now, guard_until=now + FIVE_HOURS + GRACE,
+               pending_verify=True, uncertain_attempt=True, cycle_confirmed=False, clock_checks=0, next_at=now + 60,
+               model=model,
+               status="submitted", triggers=row.get("triggers", 0) + 1, failures=0)
+    persist()  # Durable BEFORE POST: a restart must not duplicate this request.
+    try:
+        result = argon.safe_result(await api.generate(cid, provider_id=c['provider_id'], model=model))
+    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as e:
+        row.update(status="delivery_uncertain", generation_error=type(e).__name__)
+        persist()
+        emit("delivery_uncertain", credential_id=cid, error_type=type(e).__name__)
+        return
+    row['last_generation'] = result
+    row['status'] = 'pending_verification' if result['ok'] else 'response_unverified'
+    # A response is not a verified running cycle. Never log "triggered/success"
+    # solely because HTTP succeeded and an arbitrary text part was nonempty.
+    emit('claude_response_received', credential_id=cid, **result)
+    persist()
+
+
+def quota_failure(row, now, error, persist, emit):
+    count = row.get("failures", 0) + 1
+    row.update(failures=count, last_error=type(error).__name__)
+    if count > len(RETRY_DELAYS):
+        row.update(paused=True, status="paused_quota_error")
+    else:
+        row.update(next_at=now + RETRY_DELAYS[count - 1], status="quota_retry_wait")
+    persist()
+    fields = {"credential_id": row.get("credential_id"), "failures": count,
+              "paused": bool(row.get("paused")), "error_type": type(error).__name__}
+    if isinstance(error, httpx.HTTPStatusError):
+        # Status and a fixed operation label diagnose local auth/route errors
+        # without logging exception text, tokens, headers, bodies or URLs.
+        fields.update(http_status=error.response.status_code, method=error.request.method)
+        operation = error.request.url.path.rsplit('/', 1)[-1]
+        if operation in ('quota-probe', 'quota-diagnostics', 'quota', 'reveal', 'login', 'providers', 'credentials', 'test'):
+            fields['operation'] = operation.replace('-', '_')
+    emit("quota_failed", **fields)
+
+
+
+class QuotaKeeper:
+    def __init__(self, *, lookup: Callable, state_dir: str, base_url: str,
+                 credentials_file: str, log: Callable[[str], None],
+                 cli_base_url='http://agy-hybrid-gateway:8080',
+                 cli_token_file='/run/secrets/quota-keeper/agy-cli.token',
+                 client_factory=None, clock=time.time, shutdown_timeout=100):
+        self.lookup = lookup
+        self.store = StateStore(state_dir)
+        self.base_url = base_url
+        self.credentials_file = credentials_file
+        self.log = log
+        self.client_factory = client_factory or (lambda: cli.UnifiedClient(base_url, credentials_file,
+            cli_settings=self.cli_settings(), cli_base_url=cli_base_url, cli_token_file=cli_token_file))
+        self.clock = clock
+        self.shutdown_timeout = shutdown_timeout
+        self._task = None
+        self._stop = asyncio.Event()
+        self._mutation_lock = asyncio.Lock()
+        self._last_error = None
+        self._last_sweep_at = None
+        self._lock_busy = False
+        self._in_sweep = False
+        self._last_summary = None
+
+    def enabled(self) -> bool:
+        return coerce_bool(self.lookup('quota_keeper', 'enabled'), False)
+
+    def interval(self) -> float:
+        try:
+            value = float(self.lookup('quota_keeper', 'check_interval_sec') or 60)
+        except (TypeError, ValueError):
+            value = 60
+        # Configuration cannot turn this feature into a request flood.
+        return min(3600, max(60, value))
+
+    def claude_settings(self):
+        try:
+            return claude.settings(self.lookup('quota_keeper', 'claude'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': MODEL, 'configuration_error': 'invalid_settings'}
+
+    def cli_settings(self):
+        try:
+            return cli.settings(self.lookup('quota_keeper', 'cli'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'refresh_interval_sec': 300, 'configuration_error': 'invalid_settings'}
+
+    def configured_claude_model(self, ids):
+        try:
+            return claude.select_model(self.claude_settings(), [{'id': cid} for cid in ids])
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def argon_settings(self):
+        try:
+            return argon.settings(self.lookup('quota_keeper', 'argon_weekly'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': 'gemini-4-argon-low',
+                    'configuration_error': 'invalid_settings'}
+
+    def hydrogen_settings(self):
+        try:
+            return hydrogen.settings(self.lookup('quota_keeper', 'hydrogen'))
+        except (ValueError, TypeError):
+            return {'enabled': False, 'model': hydrogen.DEFAULT_MODEL,
+                    'configuration_error': 'invalid_settings'}
+
+    def emit(self, event: str, **fields):
+        # Do not pass exception messages, credentials, arbitrary reply text or URLs.
+        fields.pop('reply', None)
+        self.log('quota_keeper ' + json.dumps({'event': event, **fields}, ensure_ascii=False))
+
+    async def start(self):
+        if self._task is not None and not self._task.done():
+            return
+        self._stop.clear()
+        self._task = asyncio.create_task(self._run(), name='antigravity-claude-quota-keeper')
+
+    async def stop(self):
+        self._stop.set()
+        if self._task is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._task), self.shutdown_timeout)
+        except asyncio.TimeoutError:
+            # Keep the singleton lease and existing request alive during a
+            # rolling handoff. A drain wait is not a generation deadline.
+            self.emit('shutdown_waiting_for_inflight_work')
+        finally:
+            with suppress(asyncio.CancelledError):
+                await self._task
+            self._task = None
+
+    async def _run(self):
+        next_sweep = 0.0
+        previous_enabled = None
+        while not self._stop.is_set():
+            try:
+                enabled = self.enabled()
+                if enabled != previous_enabled:
+                    self.emit('enabled' if enabled else 'disabled')
+                    if enabled:
+                        next_sweep = 0.0
+                    previous_enabled = enabled
+                if enabled and time.monotonic() >= next_sweep:
+                    await self.sweep()
+                    self._last_error = None
+                    next_sweep = time.monotonic() + self.interval()
+            except Exception as exc:
+                self._last_error = type(exc).__name__
+                self.emit('sweep_error', error_type=self._last_error)
+                next_sweep = time.monotonic() + 60
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+
+    async def sweep(self):
+        if not self.enabled() or self._stop.is_set():
+            return
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                self._lock_busy = not acquired
+                if not acquired:
+                    self.emit('lock_busy')
+                    return
+                state = self.store.load()
+                persist = lambda: self.store.save(state)
+                self._in_sweep = True
+                try:
+                    cli_config = self.cli_settings()
+                    async with self.client_factory() as api:
+                        if hasattr(api, 'groups'):
+                            groups = await api.groups()
+                        else:
+                            providers = await api.api('providers')
+                            provider_ids = {p['id'] for p in providers
+                                            if p['channel'] == 'antigravity' and p.get('enabled', True)}
+                            groups = account_groups(await api.api('credentials'), provider_ids)
+                        for key, row in state['accounts'].items():
+                            row['active'] = key in groups
+                        for key, members in groups.items():
+                            if self._stop.is_set() or not self.enabled():
+                                break
+                            row = state['accounts'].setdefault(key, {})
+                            row.update(credential_ids=sorted((c['id'] for c in members), key=str), active=True)
+                            legacy = [m for m in members if m.get('transport') != 'cli']
+                            if not legacy:
+                                row.setdefault('status', 'not_applicable')
+                            families = cli.family_members(members)
+                            metadata_ready = True
+                            if cli.cli_members(members):
+                                metadata_ready = await cli.refresh_observations(api, members, row, persist,
+                                    now=self.clock(), interval=cli_config['refresh_interval_sec'])
+                            transport_allowed = all(m.get('dispatch_status', 'eligible') == 'eligible' for m in families)
+                            permission_denied = any(m.get('dispatch_status') in
+                                ('service_disabled', 'account_permission_denied') for m in families)
+                            claude_config = self.claude_settings()
+                            if claude_config['enabled'] and legacy:
+                                try:
+                                    await handle_account(
+                                        api, legacy, row, persist, self.emit, clock=self.clock,
+                                        model=claude.select_model(claude_config, legacy), may_generate=lambda: (
+                                            self.enabled() and not self._stop.is_set()
+                                            and self.claude_settings() == claude_config))
+                                except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                    quota_failure(row, self.clock(), exc, persist, self.emit)
+                            argon_config = self.argon_settings()
+                            if argon_config['enabled'] and metadata_ready and (transport_allowed or permission_denied) and self.enabled() and not self._stop.is_set():
+                                weekly = row.setdefault('argon_weekly', {})
+                                if hydrogen.permission_refusal(row) or permission_denied:
+                                    weekly.update(paused=True, status='paused_account_permission')
+                                    persist()
+                                else:
+                                    try:
+                                        await argon.handle_argon_account(
+                                            api, families, weekly, persist, self.emit,
+                                            model=argon_config['model'], clock=self.clock,
+                                            may_generate=lambda: (self.enabled() and not self._stop.is_set()
+                                                                  and self.argon_settings() == argon_config
+                                                                  and self.cli_settings() == cli_config
+                                                                  and not hydrogen.permission_refusal(row)))
+                                    except cli.ControlBusy:
+                                        weekly['next_at'] = self.clock() + 15
+                                        persist()
+                                    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                        argon.quota_failure(weekly, self.clock(), exc, persist, self.emit)
+                            hydrogen_config = self.hydrogen_settings()
+                            if hydrogen_config['enabled'] and metadata_ready and (transport_allowed or permission_denied) and self.enabled() and not self._stop.is_set():
+                                shared = row.setdefault('hydrogen', {})
+                                if hydrogen.permission_refusal(row) or permission_denied:
+                                    shared.update(paused=True, status='paused_account_permission')
+                                    persist()
+                                else:
+                                    try:
+                                        await hydrogen.handle_account(
+                                            api, families, shared, persist, self.emit,
+                                            model=hydrogen_config['model'], clock=self.clock,
+                                            may_generate=lambda: (self.enabled() and not self._stop.is_set()
+                                                and self.hydrogen_settings() == hydrogen_config
+                                                and self.cli_settings() == cli_config
+                                                and not hydrogen.permission_refusal(row)))
+                                    except cli.ControlBusy:
+                                        shared['next_at'] = self.clock() + 15
+                                        persist()
+                                    except (httpx.HTTPError, ProbeError, ValueError, KeyError) as exc:
+                                        hydrogen.quota_failure(shared, self.clock(), exc, persist, self.emit)
+                    state['last_run_at'] = self.clock()
+                    state['schema_version'] = 1
+                    persist()
+                    self._last_sweep_at = state['last_run_at']
+                    summary = (len(groups), sum(bool(r.get('paused')) for r in state['accounts'].values()
+                                                if r.get('active')))
+                    if summary != self._last_summary:
+                        self.emit('account_summary_changed', unique_accounts=summary[0], paused=summary[1])
+                        self._last_summary = summary
+                finally:
+                    self._in_sweep = False
+
+    def status(self) -> dict:
+        # Disk-only, including when the feature is disabled or unavailable.
+        # Neither this method nor /health can wake a model or refresh upstream.
+        enabled = self.enabled()
+        error = self._last_error
+        try:
+            state = self.store.load()
+        except StateError as exc:
+            state = {'accounts': {}}
+            error = type(exc).__name__
+        accounts = []
+        for row in state['accounts'].values():
+            generation = argon.safe_result(row.get('last_generation') or {})
+            accounts.append({
+                'credential_ids': row.get('credential_ids', []),
+                'credential_id': row.get('credential_id'),
+                'active': bool(row.get('active')),
+                'paused': bool(row.get('paused')),
+                'status': row.get('status', 'uninitialized'),
+                'next_at': row.get('next_at'),
+                'guard_until': row.get('guard_until'),
+                'last_trigger_at': row.get('last_trigger_at'),
+                'last_probe_at': row.get('last_probe_at'),
+                'cycle_confirmed': bool(row.get('cycle_confirmed')),
+                'pending_verify': bool(row.get('pending_verify')),
+                'uncertain_attempt': bool(row.get('uncertain_attempt')),
+                'model': row.get('model'),
+                'configured_model': self.configured_claude_model(row.get('credential_ids', [])),
+                'attempts': row.get('triggers', 0),
+                'quota_failures': row.get('failures', 0),
+                'windows': row.get('windows', {}),
+                'argon_weekly': argon.status(row.get('argon_weekly', {})),
+                'hydrogen': hydrogen.status(row.get('hydrogen', {})),
+                'cli_quota': {k: v for k, v in row.get('cli_quota', {}).items() if k in
+                    ('status', 'credential_id', 'last_attempt_at', 'last_success_at', 'next_at', 'observed_at_ms', 'windows', 'error')},
+                'last_generation': {key: generation[key] for key in
+                    ('http_status', 'ok', 'transport_ok', 'generation_evidence', 'usage') if key in generation},
+            })
+        return {
+            'enabled': enabled,
+            'status': 'disabled' if not enabled else ('degraded' if error else
+                      'standby' if self._lock_busy else 'running'),
+            'model': self.claude_settings()['model'],
+            'claude': self.claude_settings(),
+            'argon_weekly': self.argon_settings(),
+            'hydrogen': self.hydrogen_settings(),
+            'cli': self.cli_settings(),
+            'check_interval_sec': self.interval(),
+            'worker_running': self._task is not None and not self._task.done(),
+            'in_sweep': self._in_sweep,
+            'last_error': error,
+            'last_run_at': state.get('last_run_at'),
+            'unique_active_accounts': sum(a['active'] for a in accounts),
+            'paused_accounts': sum(a['active'] and a['paused'] for a in accounts),
+            'accounts': accounts,
+        }
+
+    async def resume(self, credential_id: int) -> str:
+        # Schedule a re-check; never erase the guard or send a request here.
+        if self._mutation_lock.locked():
+            return 'busy'
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                if not acquired:
+                    return 'busy'
+                state = self.store.load()
+                for row in state['accounts'].values():
+                    if credential_id in row.get('credential_ids', []):
+                        row.update(paused=False, failures=0, next_at=0,
+                                   status='resume_scheduled')
+                        self.store.save(state)
+                        self.emit('resume_scheduled', credential_id=credential_id)
+                        return 'scheduled'
+                return 'not_found'
+
+
+    async def resume_argon(self, credential_id):
+        """Recheck only: an uncertain paid attempt is never erased by resume."""
+        if self._mutation_lock.locked():
+            return 'busy'
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                if not acquired:
+                    return 'busy'
+                state = self.store.load()
+                for row in state['accounts'].values():
+                    if credential_id in row.get('credential_ids', []):
+                        weekly = row.setdefault('argon_weekly', {})
+                        weekly.update(paused=False, failures=0, next_at=0,
+                                      status='resume_scheduled')
+                        self.store.save(state)
+                        self.emit('argon_resume_scheduled', credential_id=credential_id)
+                        return 'scheduled'
+                return 'not_found'
+
+    async def resume_hydrogen(self, credential_id):
+        """Recheck only: an uncertain paid attempt is never erased by resume."""
+        if self._mutation_lock.locked():
+            return 'busy'
+        async with self._mutation_lock:
+            with self.store.locked() as acquired:
+                if not acquired:
+                    return 'busy'
+                state = self.store.load()
+                for row in state['accounts'].values():
+                    if credential_id in row.get('credential_ids', []):
+                        weekly = row.setdefault('hydrogen', {})
+                        weekly.update(paused=False, failures=0, next_at=0,
+                                      status='resume_scheduled')
+                        self.store.save(state)
+                        self.emit('hydrogen_resume_scheduled', credential_id=credential_id)
+                        return 'scheduled'
+                return 'not_found'

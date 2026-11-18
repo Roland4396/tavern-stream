@@ -1,0 +1,26 @@
+--- a/aetherstream/features/kunlun_linux.py
++++ b/aetherstream/features/kunlun_linux.py
+@@ -49,3 +49,4 @@
+ def validate_settings(config):
+-    allowed = {"enabled", "match", "transports", "source_sha256", "default_insert_count"}
++    allowed = {"enabled", "match", "transports", "source_sha256", "default_insert_count",
++               "reuse_existing_tools", "require_tool_choice"}
+     if not isinstance(config, dict) or set(config) - allowed:
+@@ -54,2 +55,5 @@
+         raise ValueError("kunlun_linux.enabled must be boolean")
++    for key in ("reuse_existing_tools", "require_tool_choice"):
++        if key in config and not isinstance(config[key], bool):
++            raise ValueError("kunlun_linux." + key + " must be boolean")
+     if "default_insert_count" in config:
+@@ -328,2 +332,6 @@
+     validate_settings(config)
++    if config.get("reuse_existing_tools") and payload.get("tools"):
++        from aetherstream.features.caller_output_tools import prepare_existing_tools
++        return prepare_existing_tools(payload, require=config.get("require_tool_choice", False),
++                                      log=log, trace_prefix=trace_prefix)
+     messages = payload.get("messages")
+@@ -529,3 +537,3 @@
+     payload["tools"] = copy.deepcopy(tools) + [tool]
+-    payload["tool_choice"] = "auto"
++    payload["tool_choice"] = "required" if config.get("require_tool_choice") else "auto"
+     harmless = guide_messages or [
